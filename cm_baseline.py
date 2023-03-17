@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from tqdm import trange
 from pytorch_lightning import seed_everything
 from annotator.util import resize_image, HWC3
 from annotator.openpose import OpenposeDetector
@@ -21,48 +20,6 @@ def extract_into_tensor(a, t, x_shape):
     b, *_ = t.shape
     out = a.gather(-1, t)
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-@torch.no_grad()
-def interpolate_spherical(p0, p1, fract_mixing: float):
-    r""" Copied from lunarring/latentblending
-    Helper function to correctly mix two random variables using spherical interpolation.
-    The function will always cast up to float64 for sake of extra 4.
-    Args:
-        p0: 
-            First tensor for interpolation
-        p1: 
-            Second tensor for interpolation
-        fract_mixing: float 
-            Mixing coefficient of interval [0, 1]. 
-            0 will return in p0
-            1 will return in p1
-            0.x will return a mix between both preserving angular velocity.
-    """ 
-    if p0.dtype == torch.float16:
-        recast_to = 'fp16'
-    else:
-        recast_to = 'fp32'
-    
-    p0 = p0.double()
-    p1 = p1.double()
-    norm = torch.linalg.norm(p0) * torch.linalg.norm(p1)
-    epsilon = 1e-7
-    dot = torch.sum(p0 * p1) / norm
-    dot = dot.clamp(-1+epsilon, 1-epsilon)
-    
-    theta_0 = torch.arccos(dot)
-    sin_theta_0 = torch.sin(theta_0)
-    theta_t = theta_0 * fract_mixing
-    s0 = torch.sin(theta_0 - theta_t) / sin_theta_0
-    s1 = torch.sin(theta_t) / sin_theta_0
-    interp = p0*s0 + p1*s1
-    
-    if recast_to == 'fp16':
-        interp = interp.half()
-    elif recast_to == 'fp32':
-        interp = interp.float()
-        
-    return interp
 
 def to_pil(rgb):
     if len(rgb.shape) == 3:
@@ -127,100 +84,30 @@ class ContextManager:
         
     @torch.no_grad()
     def interpolate_pose(self, img1, pose_md1, img2, pose_md2, prompt, n_prompt,
-                    ddim_steps=100, num_frames=33, steps_per_frame=3, guide_scale=7.5,
+                    num_frames=10, ddim_steps=50, guide_scale=7.5, time_frac=0.5,
                     ctrl_scale=1.0):
-        """
-        ddim_steps: number of steps in DDIM sampling
-        num_frames: includes endpoints (both original images)
-        steps_per_frame: each successive level adds this many more ddim steps
-        """
         if isinstance(img1, Image.Image):
             img1 = torch.tensor(np.array(img1)).float().cuda() / 127.5 - 1.0
             img2 = torch.tensor(np.array(img2)).float().cuda() / 127.5 - 1.0
-        self.ddim_sampler.make_schedule(ddim_steps)
-        assert ddim_steps >= num_frames*steps_per_frame
-        assert abs(np.log2(num_frames-1) % 1) < 1e-5
-        timesteps = self.ddim_sampler.ddim_timesteps[:num_frames*steps_per_frame]
-
+        frames = [img1]
         self.change_mode('pose')
         ldm = self.model
-        H = W = 512
-        shape = (4, H // 8, W // 8)
-        ldm.control_scales = [ctrl_scale] * 13
-        cond = {"c_crossattn": [ldm.get_learned_conditioning([prompt])]}
-        un_cond = {"c_crossattn": [ldm.get_learned_conditioning([n_prompt])]}
+        latents1 = ldm.get_first_stage_encoding(ldm.encode_first_stage(img1.permute(2,0,1).unsqueeze(0)))
+        latents2 = ldm.get_first_stage_encoding(ldm.encode_first_stage(img2.permute(2,0,1).unsqueeze(0)))
 
-        latents1, latents2 = self.get_latent_stack(img1, img2, timesteps[:num_frames])
-        latents = [None] * num_frames
-        df = num_frames - 1
-        t_by_frame = [None] * num_frames
-        while df > 1:
-            level = (num_frames-1)//df
-            latents[0] = latents1[-level]
-            latents[-1] = latents2[-level]
-            df //= 2
-
-            for frame_ix in range(df, num_frames-1, df*2):
-                t_by_frame[frame_ix] = timesteps[level]
-                frac = .5
-                # if frame_ix-df == 0:
-                #     frac -= .15
-                # if frame_ix+df == num_frames-1:
-                #     frac += .15
-                latents[frame_ix] = interpolate_spherical(latents[frame_ix-df], latents[frame_ix+df], frac)
-
-            if level == 2:
-                latents[num_frames//2] = interpolate_spherical(latents[num_frames//4], latents[3*num_frames//4], .5)
-            
-        for frame_ix in trange(1,num_frames-1):
-            t = torch.tensor([t_by_frame[frame_ix]], dtype=torch.long, device='cuda')
-            frac = frame_ix/(num_frames-1)
-            pose_img = interp_poses(pose_md1, pose_md2, alpha=frac).transpose(2,0,1)
-            control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
-
-            cond["c_concat"] = [control]
-            un_cond["c_concat"] = [control]
-            samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
-                shape, cond, verbose=False, eta=0, x_T=latents[frame_ix], timesteps=t.item(),
-                unconditional_guidance_scale=guide_scale,
-                unconditional_conditioning=un_cond)
-
-            x_samples = ldm.decode_first_stage(samples).permute(0, 2, 3, 1)
-            x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
-            Image.fromarray(x_samples[0]).save(f'blend/{frame_ix:02d}.png')
-    
-    def get_latent_stack(self, img1, img2, timesteps):
-        ldm = self.model
-        latents1 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img1.permute(2,0,1).unsqueeze(0)))]
-        latents2 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img2.permute(2,0,1).unsqueeze(0)))]
-        
         shutil.rmtree('blend', ignore_errors=True)
         os.makedirs('blend')
-        t_prev = None
-        for t_now in timesteps:
-            noise = torch.randn_like(latents1[-1])
-            latents1.append(self.add_more_noise(latents1[-1], noise, t_now, t_prev))
-            latents2.append(self.add_more_noise(latents2[-1], noise, t_now, t_prev))
-            t_prev = t_now
-        return latents1[::-1], latents2[::-1]
-    
-    def add_more_noise(self, latents, noise, t2, t1=None):
-        ldm = self.model
-        if t1 is None:
-            return ldm.sqrt_alphas_cumprod[t2] * latents + \
-                ldm.sqrt_one_minus_alphas_cumprod[t2] * noise
+        for frame in range(1,num_frames):
+            alpha = frame/num_frames
+            pose_img = interp_poses(pose_md1, pose_md2, alpha=alpha)
+            pose_img = pose_img.transpose(2,0,1)
+            out = self.img2img(control=pose_img, latents=latents1 * alpha + latents2 * (1-alpha),
+                               mode='pose', prompt=prompt, n_prompt=n_prompt, ctrl_scale=ctrl_scale,
+                               ddim_steps=ddim_steps, guide_scale=guide_scale, time_frac=time_frac)
+            Image.fromarray(out).save(f'blend/{frame:02d}.png')
 
-        a1 = ldm.sqrt_alphas_cumprod[t1]
-        sig1 = ldm.sqrt_one_minus_alphas_cumprod[t1]
-        a2 = ldm.sqrt_alphas_cumprod[t2]
-        sig2 = ldm.sqrt_one_minus_alphas_cumprod[t2]
-
-        scale = a2/a1
-        sigma = (sig2**2 - (scale * sig1)**2).sqrt()
-        return scale * latents + sigma * noise
-    
     @torch.no_grad()
-    def img2img(self, control, prompt, n_prompt, init_img=None, noise=None, mode=None, time_frac=0.3,
+    def img2img(self, control, prompt, n_prompt, init_img=None, latents=None, mode=None, time_frac=0.3,
                 ddim_steps=50, ctrl_scale=1, guide_scale=7.5, eta=0):
         if mode is not None:
             self.change_mode(mode)
@@ -228,11 +115,9 @@ class ContextManager:
             print('no mode set')
             return
         
-        if not isinstance(control, torch.Tensor):
-            control = torch.from_numpy(control).float().cuda().unsqueeze(0) / 255.0
-            if len(control.shape) == 3:
-                control = control.tile(1, 3, 1, 1)
-
+        control = torch.from_numpy(control).float().cuda().unsqueeze(0) / 255.0
+        if len(control.shape) == 3:
+            control = control.tile(1, 3, 1, 1)
         ldm = self.model
         if init_img is not None:
             if isinstance(init_img, Image.Image):
@@ -242,7 +127,7 @@ class ContextManager:
         T = int(time_frac * ldm.num_timesteps)
         t = torch.tensor([T], dtype=torch.long, device='cuda')
         noise = torch.randn_like(latents)
-        noisy_latents = (extract_into_tensor(ldm.sqrt_alphas_cumprod, t, latents.shape) * latents +
+        x_T = (extract_into_tensor(ldm.sqrt_alphas_cumprod, t, latents.shape) * latents +
             extract_into_tensor(ldm.sqrt_one_minus_alphas_cumprod, t, latents.shape) * noise)
             
         cond = {"c_concat": [control], "c_crossattn": [ldm.get_learned_conditioning([prompt])]}
@@ -253,7 +138,7 @@ class ContextManager:
 
         ldm.control_scales = [ctrl_scale] * 13
         samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
-            shape, cond, verbose=False, eta=eta, x_T=noisy_latents, timesteps=int(time_frac * ddim_steps),
+            shape, cond, verbose=False, eta=eta, x_T=x_T, timesteps=int(time_frac * ddim_steps),
             unconditional_guidance_scale=guide_scale,
             unconditional_conditioning=un_cond)
 
