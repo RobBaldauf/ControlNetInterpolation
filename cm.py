@@ -158,47 +158,45 @@ class ContextManager:
         un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
 
         if optimize_cond:
-            T = np.random.randint(10,20)
-            eta = 0.
-            self.ddim_sampler.make_schedule(T, ddim_eta=eta, verbose=False)
             uncond_base.requires_grad_(True)
             cond1 = cond_base
             cond2 = cond_base.clone()
             cond1.requires_grad_(True)
             cond2.requires_grad_(True)
-            optimizer = torch.optim.Adam([cond1, cond2, uncond_base], lr=1e-5)
+            optimizer = torch.optim.Adam([cond1, cond2, uncond_base], lr=1e-3)
             for cur_iter in range(optimize_cond):
                 with torch.autocast('cuda'):
+                    T = np.random.randint(20,30)
+                    self.ddim_sampler.make_schedule(T, verbose=False)
+                    u = np.random.randint(T//3,2*T//3)
+
                     cond["c_crossattn"] = [cond1]
-                    t_now = self.ddim_sampler.ddim_timesteps[T]
-                    t_prev = self.ddim_sampler.ddim_timesteps[T-1]
+                    t_now = self.ddim_sampler.ddim_timesteps[-u]
+                    t_prev = self.ddim_sampler.ddim_timesteps[-u-1]
                     x_t = ldm.sqrt_alphas_cumprod[t_prev] * latents[0] + \
                         ldm.sqrt_one_minus_alphas_cumprod[t_prev] * torch.randn_like(latents[0])
                     x_T = self.add_more_noise(x_t, torch.randn_like(x_t), t_now, t_prev)
                     ts = torch.full((1,), t_now, device='cuda', dtype=torch.long)
-                    pdb.set_trace()
-                    outs = self.ddim_sampler.p_sample_grad(img, cond, ts, index=u,  unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
-                    img, pred_x0 = outs
-                    loss1 = (latents[0] - samples).abs().mean()
+                    outs = self.ddim_sampler.p_sample_grad(x_T, cond, ts, index=u,  unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
+                    pred_x_t, _ = outs
+                    loss1 = (x_t - pred_x_t).abs().mean()
                     loss1.backward()
 
-                    # samples, _ = self.ddim_sampler.sample_grad(T, 1, shape, cond, verbose=False, eta=eta, x_T=x_T, timesteps=u, unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
-                    # # grad = latents[0] - samples
-                    # # samples.backward(grad)
-                    # loss1 = (latents[0] - samples).abs().mean()
-                    # loss1.backward()
-
                     cond["c_crossattn"] = [cond2]
-                    u = np.random.randint(T//3, 2*T//3)
-                    t = self.ddim_sampler.ddim_timesteps[u]
-                    x_T = ldm.sqrt_alphas_cumprod[t] * latents[-1] + ldm.sqrt_one_minus_alphas_cumprod[t] * torch.randn_like(latents[-1])
-                    samples, _ = self.ddim_sampler.sample_grad(T, 1, shape, cond, verbose=False, eta=eta, x_T=x_T, timesteps=u, unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
-                    loss2 = (latents[-1] - samples).norm()
+                    t_now = self.ddim_sampler.ddim_timesteps[-1]
+                    t_prev = self.ddim_sampler.ddim_timesteps[-2]
+                    x_t = ldm.sqrt_alphas_cumprod[t_prev] * latents[-1] + \
+                        ldm.sqrt_one_minus_alphas_cumprod[t_prev] * torch.randn_like(latents[-1])
+                    x_T = self.add_more_noise(x_t, torch.randn_like(x_t), t_now, t_prev)
+                    ts = torch.full((1,), t_now, device='cuda', dtype=torch.long)
+                    outs = self.ddim_sampler.p_sample_grad(x_T, cond, ts, index=T-1,  unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
+                    pred_x_t, _ = outs
+                    loss2 = (x_t - pred_x_t).abs().mean()
                     loss2.backward()
 
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-                    if cur_iter % 3 == 0:
+                    if cur_iter % 20 == 0:
                         print(f'iter {cur_iter}: {loss1.item()}, {loss2.item()}')
 
             cond1.requires_grad_(False)
