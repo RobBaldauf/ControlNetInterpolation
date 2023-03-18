@@ -127,8 +127,8 @@ class ContextManager:
         
     @torch.no_grad()
     def interpolate_pose(self, img1, pose_md1, img2, pose_md2, prompt, n_prompt,
-                    ddim_steps=100, num_frames=33, steps_per_frame=3, guide_scale=7.5,
-                    ctrl_scale=1.0):
+                    ddim_steps=100, num_frames=13, steps_per_frame=10, guide_scale=7.5,
+                    ctrl_scale=1):
         """
         ddim_steps: number of steps in DDIM sampling
         num_frames: includes endpoints (both original images)
@@ -138,9 +138,10 @@ class ContextManager:
             img1 = torch.tensor(np.array(img1)).float().cuda() / 127.5 - 1.0
             img2 = torch.tensor(np.array(img2)).float().cuda() / 127.5 - 1.0
         self.ddim_sampler.make_schedule(ddim_steps)
-        assert ddim_steps >= num_frames*steps_per_frame
-        assert abs(np.log2(num_frames-1) % 1) < 1e-5
-        timesteps = self.ddim_sampler.ddim_timesteps[:num_frames*steps_per_frame]
+        if ddim_steps < num_frames*steps_per_frame/2:
+            steps_per_frame = 2*ddim_steps // num_frames
+            print(f'lowering steps_per_frame to {steps_per_frame}')
+        timesteps = self.ddim_sampler.ddim_timesteps[:num_frames*steps_per_frame//2:steps_per_frame]
 
         self.change_mode('pose')
         ldm = self.model
@@ -150,44 +151,34 @@ class ContextManager:
         cond = {"c_crossattn": [ldm.get_learned_conditioning([prompt])]}
         un_cond = {"c_crossattn": [ldm.get_learned_conditioning([n_prompt])]}
 
-        latents1, latents2 = self.get_latent_stack(img1, img2, timesteps[:num_frames])
+        latents1, latents2 = self.get_latent_stack(img1, img2, timesteps)
         latents = [None] * num_frames
-        df = num_frames - 1
-        t_by_frame = [None] * num_frames
-        while df > 1:
-            level = (num_frames-1)//df
-            latents[0] = latents1[-level]
-            latents[-1] = latents2[-level]
-            df //= 2
-
-            for frame_ix in range(df, num_frames-1, df*2):
-                t_by_frame[frame_ix] = timesteps[level]
-                frac = .5
-                # if frame_ix-df == 0:
-                #     frac -= .15
-                # if frame_ix+df == num_frames-1:
-                #     frac += .15
-                latents[frame_ix] = interpolate_spherical(latents[frame_ix-df], latents[frame_ix+df], frac)
-
-            if level == 2:
-                latents[num_frames//2] = interpolate_spherical(latents[num_frames//4], latents[3*num_frames//4], .5)
-            
+        latents[0] = latents1[0]
+        latents[-1] = latents2[0]
+        # if num_frames % 2 == 0:
+        #     t_by_frame = timesteps.tolist() + timesteps[::-1].tolist()
+        # else:
+        #     t_by_frame = timesteps[:-1].tolist() + timesteps[::-1].tolist()
+        
         for frame_ix in trange(1,num_frames-1):
-            t = torch.tensor([t_by_frame[frame_ix]], dtype=torch.long, device='cuda')
             frac = frame_ix/(num_frames-1)
+            # t = t_by_frame[frame_ix]
+            f = min(frame_ix, num_frames - frame_ix - 1)
+            latents[frame_ix] = interpolate_spherical(latents1[f], latents2[f], frac)
             pose_img = interp_poses(pose_md1, pose_md2, alpha=frac).transpose(2,0,1)
             control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
 
             cond["c_concat"] = [control]
             un_cond["c_concat"] = [control]
             samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
-                shape, cond, verbose=False, eta=0, x_T=latents[frame_ix], timesteps=t.item(),
+                shape, cond, verbose=False, eta=0.5, x_T=latents[frame_ix], timesteps=f*steps_per_frame,
                 unconditional_guidance_scale=guide_scale,
                 unconditional_conditioning=un_cond)
 
             x_samples = ldm.decode_first_stage(samples).permute(0, 2, 3, 1)
             x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
             Image.fromarray(x_samples[0]).save(f'blend/{frame_ix:02d}.png')
+
     
     def get_latent_stack(self, img1, img2, timesteps):
         ldm = self.model
@@ -202,7 +193,7 @@ class ContextManager:
             latents1.append(self.add_more_noise(latents1[-1], noise, t_now, t_prev))
             latents2.append(self.add_more_noise(latents2[-1], noise, t_now, t_prev))
             t_prev = t_now
-        return latents1[::-1], latents2[::-1]
+        return latents1, latents2
     
     def add_more_noise(self, latents, noise, t2, t1=None):
         ldm = self.model
