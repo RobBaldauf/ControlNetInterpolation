@@ -6,6 +6,7 @@ import os
 import numpy as np
 import torch
 from PIL import Image
+from torchvision import transforms
 
 from tqdm import trange
 from pytorch_lightning import seed_everything
@@ -125,16 +126,16 @@ class ContextManager:
             return pred_pose, metadata
         return pred_pose
         
-    def interpolate_pose(self, img1, pose_md1, img2, pose_md2, prompt, n_prompt, num_frames,
-                    ddim_steps=100, guide_scale=7.5, optimize_cond=0): #steps_per_frame=10, 
+    def interpolate_pose(self, img1, pose_md1, img2, pose_md2, num_frames, cond_path=None,
+    prompt=None, n_prompt=None, ddim_steps=100, guide_scale=7.5, optimize_cond=0): #steps_per_frame=10, 
         """
         ddim_steps: number of steps in DDIM sampling
         num_frames: includes endpoints (both original images)
         steps_per_frame: each successive level adds this many more ddim steps
         """
         if isinstance(img1, Image.Image):
-            img1 = torch.tensor(np.array(img1)).float().cuda() / 127.5 - 1.0
-            img2 = torch.tensor(np.array(img2)).float().cuda() / 127.5 - 1.0
+            img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
+            img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
         # if ddim_steps < num_frames*steps_per_frame/2:
         #     steps_per_frame = 2*ddim_steps // num_frames
         #     print(f'lowering steps_per_frame to {steps_per_frame}')
@@ -143,68 +144,88 @@ class ContextManager:
         ldm = self.model
         H = W = 512
         shape = (4, H // 8, W // 8)
+        augment = transforms.TrivialAugmentWide(num_magnitude_bins=20)
+        # transforms.Compose([
+        #     transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
+        #     transforms.RandomResizedCrop(size=(512,512), scale=(0.8,1.0)),
+        #     transforms.RandomPosterize(bits=4),
+        # ])
+
+        if cond_path and os.path.exists(cond_path):
+            optimize_cond = True
+            cond1, cond2, uncond_base = torch.load(cond_path)
+            cond = {}
+            un_cond = {"c_crossattn": [uncond_base]}
+        else:
+            cond_base = ldm.get_learned_conditioning([prompt])
+            uncond_base = ldm.get_learned_conditioning([n_prompt])
+            cond = {"c_crossattn": [cond_base], 'c_concat': None}
+            un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
+
+            if optimize_cond:
+                uncond_base.requires_grad_(True)
+                cond1 = cond_base
+                cond2 = cond_base.clone()
+                cond1.requires_grad_(True)
+                cond2.requires_grad_(True)
+                optimizer = torch.optim.Adam([cond1, cond2, uncond_base], lr=1e-3)
+                T = 20
+                self.ddim_sampler.make_schedule(T, verbose=False)
+                for cur_iter in range(optimize_cond):
+                    L1 = ldm.get_first_stage_encoding(ldm.encode_first_stage(augment(img1).float() / 127.5 - 1.0))
+                    L2 = ldm.get_first_stage_encoding(ldm.encode_first_stage(augment(img2).float() / 127.5 - 1.0))
+                    with torch.autocast('cuda'):
+                        u = np.random.randint(T//3, 2*T//3)
+
+                        cond["c_crossattn"] = [cond1]
+                        t_now = self.ddim_sampler.ddim_timesteps[u]
+                        t_prev = self.ddim_sampler.ddim_timesteps[u-1]
+                        x_t_prev = ldm.sqrt_alphas_cumprod[t_prev] * L1 + \
+                            ldm.sqrt_one_minus_alphas_cumprod[t_prev] * torch.randn_like(L1)
+                        x_t_now = self.add_more_noise(x_t_prev, torch.randn_like(x_t_prev), t_now, t_prev)
+                        ts = torch.full((1,), t_now, device='cuda', dtype=torch.long)
+                        outs = self.ddim_sampler.p_sample_grad(x_t_now, cond, ts, index=T-u,  unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
+                        pred_x, _ = outs
+                        loss1 = (x_t_prev - pred_x).pow(2).mean()
+                        loss1.backward()
+
+                        cond["c_crossattn"] = [cond2]
+                        t_now = self.ddim_sampler.ddim_timesteps[u]
+                        t_prev = self.ddim_sampler.ddim_timesteps[u-1]
+                        x_t_prev = ldm.sqrt_alphas_cumprod[t_prev] * L2 + \
+                            ldm.sqrt_one_minus_alphas_cumprod[t_prev] * torch.randn_like(L2)
+                        x_t_now = self.add_more_noise(x_t_prev, torch.randn_like(x_t_prev), t_now, t_prev)
+                        ts = torch.full((1,), t_now, device='cuda', dtype=torch.long)
+                        outs = self.ddim_sampler.p_sample_grad(x_t_now, cond, ts, index=T-u,  unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
+                        # index may be off by 1
+                        pred_x, _ = outs
+                        loss2 = (x_t_prev - pred_x).pow(2).mean()
+                        loss2.backward()
+
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        if cur_iter % 50 == 0:
+                            print(f'iter {cur_iter}: {loss1.item()}, {loss2.item()}')
+
+                cond1.requires_grad_(False)
+                cond2.requires_grad_(False)
+                uncond_base.requires_grad_(False)
+
+            if cond_path:
+                torch.save((cond1, cond2, uncond_base), cond_path)
+
+        img1 = img1.float() / 127.5 - 1.0
+        img2 = img2.float() / 127.5 - 1.0
         # schedules include endpoints
         self.ddim_sampler.make_schedule(ddim_steps, verbose=False)
-        step_schedule = [int(8*x**.5) for x in np.linspace(0, 70, (num_frames+1)//2)]
+        step_schedule = [int(9*x**.5) for x in np.linspace(0, 70, (num_frames+1)//2)]
         timestep_schedule = [self.ddim_sampler.ddim_timesteps[s] for s in step_schedule]
         latents1, latents2 = self.get_latent_stack(img1, img2, timestep_schedule)
         latents = [None] * num_frames
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
         
-        cond_base = ldm.get_learned_conditioning([prompt])
-        uncond_base = ldm.get_learned_conditioning([n_prompt])
-        cond = {"c_crossattn": [cond_base], 'c_concat': None}
-        un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
-
-        if optimize_cond:
-            uncond_base.requires_grad_(True)
-            cond1 = cond_base
-            cond2 = cond_base.clone()
-            cond1.requires_grad_(True)
-            cond2.requires_grad_(True)
-            optimizer = torch.optim.Adam([cond1, cond2, uncond_base], lr=1e-3)
-            for cur_iter in range(optimize_cond):
-                with torch.autocast('cuda'):
-                    T = np.random.randint(20,30)
-                    self.ddim_sampler.make_schedule(T, verbose=False)
-                    u = np.random.randint(T//3,2*T//3)
-
-                    cond["c_crossattn"] = [cond1]
-                    t_now = self.ddim_sampler.ddim_timesteps[-u]
-                    t_prev = self.ddim_sampler.ddim_timesteps[-u-1]
-                    x_t = ldm.sqrt_alphas_cumprod[t_prev] * latents[0] + \
-                        ldm.sqrt_one_minus_alphas_cumprod[t_prev] * torch.randn_like(latents[0])
-                    x_T = self.add_more_noise(x_t, torch.randn_like(x_t), t_now, t_prev)
-                    ts = torch.full((1,), t_now, device='cuda', dtype=torch.long)
-                    outs = self.ddim_sampler.p_sample_grad(x_T, cond, ts, index=u,  unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
-                    pred_x_t, _ = outs
-                    loss1 = (x_t - pred_x_t).abs().mean()
-                    loss1.backward()
-
-                    cond["c_crossattn"] = [cond2]
-                    t_now = self.ddim_sampler.ddim_timesteps[-1]
-                    t_prev = self.ddim_sampler.ddim_timesteps[-2]
-                    x_t = ldm.sqrt_alphas_cumprod[t_prev] * latents[-1] + \
-                        ldm.sqrt_one_minus_alphas_cumprod[t_prev] * torch.randn_like(latents[-1])
-                    x_T = self.add_more_noise(x_t, torch.randn_like(x_t), t_now, t_prev)
-                    ts = torch.full((1,), t_now, device='cuda', dtype=torch.long)
-                    outs = self.ddim_sampler.p_sample_grad(x_T, cond, ts, index=T-1,  unconditional_guidance_scale=guide_scale, unconditional_conditioning=un_cond)
-                    pred_x_t, _ = outs
-                    loss2 = (x_t - pred_x_t).abs().mean()
-                    loss2.backward()
-
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    if cur_iter % 20 == 0:
-                        print(f'iter {cur_iter}: {loss1.item()}, {loss2.item()}')
-
-            cond1.requires_grad_(False)
-            cond2.requires_grad_(False)
-            uncond_base.requires_grad_(False)
-
         with torch.no_grad():
-            self.ddim_sampler.make_schedule(ddim_steps, verbose=False)
             for frame_ix in trange(1,num_frames-1):
                 frac = frame_ix/(num_frames-1)
                 f = min(frame_ix, num_frames - frame_ix - 1)
@@ -230,8 +251,8 @@ class ContextManager:
     
     def get_latent_stack(self, img1, img2, timesteps):
         ldm = self.model
-        latents1 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img1.permute(2,0,1).unsqueeze(0)))]
-        latents2 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img2.permute(2,0,1).unsqueeze(0)))]
+        latents1 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img1))]
+        latents2 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img2))]
         
         shutil.rmtree('blend', ignore_errors=True)
         os.makedirs('blend')
