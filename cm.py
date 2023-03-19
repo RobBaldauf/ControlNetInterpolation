@@ -8,6 +8,7 @@ import torch
 from PIL import Image
 from torchvision import transforms
 
+import yaml
 from tqdm import trange
 from pytorch_lightning import seed_everything
 from annotator.util import resize_image, HWC3
@@ -18,9 +19,13 @@ from cldm.model import create_model, load_state_dict
 from cldm.ddim_hacked import DDIMSampler
 from controlnet.annotator.openpose import util
 
-def get_step_schedule(ddim_steps, num_levels):
-    # return [int(.13*ddim_steps*x**.5) for x in np.linspace(0, 40, num_levels+1)]
-    return [int(.7*ddim_steps*x**.5) for x in np.linspace(0, 100, num_levels+1)]
+def get_step_schedule(max_steps, num_levels, schedule_type='convex'):
+    if schedule_type == 'concave':
+        return [int(max_steps * x**.5 / 10) for x in np.linspace(0, 100, num_levels+1)]
+    elif schedule_type == 'convex':
+        return [int(max_steps * x**2 / 16) for x in np.linspace(0, 4, num_levels+1)]
+    elif schedule_type == 'linear':
+        return [int(x) for x in np.linspace(0, max_steps, num_levels+1)]
 
 def extract_into_tensor(a, t, x_shape):
     b, *_ = t.shape
@@ -196,13 +201,31 @@ class ContextManager:
         uncond_base.requires_grad_(False)
         return cond1, cond2, uncond_base
 
-    def interpolate_pose_alt(self, img1, pose_md1, img2, pose_md2, num_frames, cond_path=None, cond_lr=1e-4, prompt=None, n_prompt=None, ddim_steps=250, guide_scale=7.5, optimize_cond=0, out_dir='blend'): #steps_per_frame=10, 
-        """
-        ddim_steps: number of steps in DDIM sampling
-        num_frames: includes endpoints (both original images)
-        steps_per_frame: each successive level adds this many more ddim steps
-        """
+    def interpolate_naive(self, img1, img2, num_frames, out_dir='blend'):
         if isinstance(img1, Image.Image):
+            img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
+            img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
+        ldm = self.model
+        L1 = ldm.get_first_stage_encoding(ldm.encode_first_stage(img1.float() / 127.5 - 1.0))
+        L2 = ldm.get_first_stage_encoding(ldm.encode_first_stage(img2.float() / 127.5 - 1.0))
+        shutil.rmtree(out_dir, ignore_errors=True)
+        os.makedirs(out_dir)
+        for frame_ix in trange(1,num_frames-1):
+            frac = frame_ix/(num_frames-1)
+            latent = interpolate_spherical(L1, L2, frac)
+            x_samples = ldm.decode_first_stage(latent).permute(0, 2, 3, 1)
+            x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+            Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
+
+    def interpolate_then_diffuse(self, img1, pose_md1, img2, pose_md2, num_frames, cond_path=None, cond_lr=1e-4, prompt=None, n_prompt=None, ddim_steps=250, guide_scale=7.5, schedule_type='concave', optimize_cond=0, out_dir='blend'): #steps_per_frame=10, 
+        """
+        each successive frame has more noise than the previous
+        """
+        shutil.rmtree(out_dir, ignore_errors=True)
+        os.makedirs(out_dir)
+        if isinstance(img1, Image.Image):
+            img1.save(f'{out_dir}/{0:03d}.png')
+            img2.save(f'{out_dir}/{num_frames-1:03d}.png')
             img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
             img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
         
@@ -232,15 +255,13 @@ class ContextManager:
         img2 = img2.float() / 127.5 - 1.0
         # schedules include endpoints
         self.ddim_sampler.make_schedule(ddim_steps, verbose=False)
-        step_schedule = get_step_schedule(ddim_steps, (num_frames+1)//2)
+        step_schedule = get_step_schedule(.7*ddim_steps, (num_frames+1)//2, schedule_type=schedule_type)
         timestep_schedule = [self.ddim_sampler.ddim_timesteps[s] for s in step_schedule]
         latents1, latents2 = self.get_latent_stack(img1, img2, timestep_schedule)
         latents = [None] * num_frames
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
         
-        shutil.rmtree(out_dir, ignore_errors=True)
-        os.makedirs(out_dir)
         with torch.no_grad():
             for frame_ix in trange(1,num_frames-1):
                 frac = frame_ix/(num_frames-1)
@@ -264,90 +285,36 @@ class ContextManager:
                 x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
                 Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
 
-    def interpolate_imgs(self, img1, img2, num_frames, cond_path=None,
-    prompt=None, n_prompt=None, ddim_steps=250, guide_scale=7.5, optimize_cond=0, cond_lr=1e-4, out_dir='blend'): #steps_per_frame=10, 
+        kwargs = dict(cond_lr=cond_lr, cond_steps=optimize_cond, prompt=prompt, n_prompt=n_prompt, ddim_steps=ddim_steps, guide_scale=guide_scale, step_schedule=step_schedule)
+        yaml.dump(kwargs, open(f'{out_dir}/args.yaml', 'w'))
+
+    def interpolate(self, img1, img2, controls=None, control_type='pose', cond_path=None, cond_lr=1e-4, prompt=None, n_prompt=None, max_steps=200, ddim_steps=250, num_frames=17, guide_scale=7.5, schedule_type='concave', optimize_cond=0, bias=0, retroactive_interp=True, out_dir='blend'):
         """
         ddim_steps: number of steps in DDIM sampling
         num_frames: includes endpoints (both original images)
-        steps_per_frame: each successive level adds this many more ddim steps
         """
-        if isinstance(img1, Image.Image):
-            img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
-            img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
-        
-        self.init_mode()
-        ldm = self.model
-        H = W = 512
-        shape = (4, H // 8, W // 8)
-        
-        if cond_path and os.path.exists(cond_path):
-            optimize_cond = True
-            cond1, cond2, uncond_base = torch.load(cond_path)
-            cond = {}
-            un_cond = {"c_crossattn": [uncond_base]}
-        else:
-            cond_base = ldm.get_learned_conditioning([prompt])
-            uncond_base = ldm.get_learned_conditioning([n_prompt])
-            cond = {"c_crossattn": [cond_base], 'c_concat': None}
-            un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
-
-            if optimize_cond:
-                cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond, cond_base, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
-                if cond_path:
-                    torch.save((cond1, cond2, uncond_base), cond_path)
-
-        img1 = img1.float() / 127.5 - 1.0
-        img2 = img2.float() / 127.5 - 1.0
-        # schedules include endpoints
-        self.ddim_sampler.make_schedule(ddim_steps, verbose=False)
-        step_schedule = get_step_schedule(ddim_steps, (num_frames+1)//2)
-        timestep_schedule = [self.ddim_sampler.ddim_timesteps[s] for s in step_schedule]
-        latents1, latents2 = self.get_latent_stack(img1, img2, timestep_schedule)
-        latents = [None] * num_frames
-        latents[0] = latents1[0]
-        latents[-1] = latents2[0]
-        
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir)
-        with torch.no_grad():
-            for frame_ix in trange(1,num_frames-1):
-                frac = frame_ix/(num_frames-1)
-                f = min(frame_ix, num_frames - frame_ix - 1)
-                latents[frame_ix] = interpolate_spherical(latents1[f], latents2[f], frac)
-
-                if optimize_cond:
-                    cond["c_crossattn"] = [interpolate_spherical(cond1, cond2, frac)]
-                samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
-                    shape, cond, verbose=False,
-                    x_T=latents[frame_ix], timesteps=step_schedule[f],
-                    unconditional_guidance_scale=guide_scale,
-                    unconditional_conditioning=un_cond)
-
-                x_samples = ldm.decode_first_stage(samples).permute(0, 2, 3, 1)
-                x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
-                Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
-
-    def interpolate_pose(self, img1, pose_md1, img2, pose_md2, cond_path=None, cond_lr=1e-4,
-    prompt=None, n_prompt=None, ddim_steps=250, num_frames=17, guide_scale=7.5, optimize_cond=0, out_dir='blend'):
-        """
-        ddim_steps: number of steps in DDIM sampling
-        num_frames: includes endpoints (both original images)
-        """
         if isinstance(img1, Image.Image):
+            img1.save(f'{out_dir}/{0:03d}.png')
+            img2.save(f'{out_dir}/{num_frames-1:03d}.png')
             img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
             img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
-        
-        self.change_mode('pose')
+
+        if controls is None:
+            self.init_mode()
+        else:
+            self.change_mode(control_type)
+
         ldm = self.model
         ldm.control_scales = [1] * 13
         H = W = 512
-        shape = (4, H // 8, W // 8)
 
         if cond_path and os.path.exists(cond_path):
             optimize_cond = True
             cond1, cond2, uncond_base = torch.load(cond_path)
-            cond = {}
-            un_cond = {"c_crossattn": [uncond_base]}
+            cond = {'c_concat': None}
+            un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
         else:
             cond_base = ldm.get_learned_conditioning([prompt])
             uncond_base = ldm.get_learned_conditioning([n_prompt])
@@ -365,7 +332,7 @@ class ContextManager:
         num_levels = int(np.log2(num_frames-1)) # does not include endpoints
         assert np.log2(num_frames-1) % 1 < 1e-5
         self.ddim_sampler.make_schedule(ddim_steps, verbose=False)
-        step_schedule = get_step_schedule(ddim_steps, num_levels)
+        step_schedule = get_step_schedule(max_steps, num_levels, schedule_type=schedule_type)
         timesteps = self.ddim_sampler.ddim_timesteps
         timestep_schedule = [timesteps[s] for s in step_schedule]
         latents1, latents2 = self.get_latent_stack(img1, img2, timestep_schedule)
@@ -373,9 +340,12 @@ class ContextManager:
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
         
-        shutil.rmtree(out_dir, ignore_errors=True)
-        os.makedirs(out_dir)
-        for level in range(1,num_levels+1):
+        if controls is not None:
+            if control_type == 'pose':
+                pose_md1, pose_md2 = controls
+            else:
+                raise NotImplementedError
+        for level in trange(1,num_levels+1):
             cur_ix = step_schedule[-level]
             prev_ix = step_schedule[-level-1]
             latents[0] = latents1[-level]
@@ -384,20 +354,29 @@ class ContextManager:
 
             for frame_ix in range(df, num_frames-1, df*2):
                 frac = .5
-                # if frame_ix-df == 0:
-                #     frac -= .15
-                # if frame_ix+df == num_frames-1:
-                #     frac += .15
+                if frame_ix-df == 0:
+                    frac -= bias
+                if frame_ix+df == num_frames-1:
+                    frac += bias
                 latents[frame_ix] = interpolate_spherical(latents[frame_ix-df], latents[frame_ix+df], frac)
 
-            if level == 2:
-                latents[num_frames//2] = interpolate_spherical(latents[num_frames//4], latents[3*num_frames//4], .5)
+            if retroactive_interp:
+                if level == 2:
+                    latents[num_frames//2] = interpolate_spherical(latents[num_frames//4], latents[3*num_frames//4], .5)
+                
+                if level == 3:
+                    latents[num_frames//4] = interpolate_spherical(latents[num_frames//8], latents[3*num_frames//8], .5)
+                    latents[num_frames//2] = interpolate_spherical(latents[3*num_frames//8], latents[5*num_frames//8], .5)
+                    latents[3*num_frames//4] = interpolate_spherical(latents[5*num_frames//8], latents[7*num_frames//8], .5)
             
             for frame_ix in range(df, num_frames-1, df): # exclude endpoints
                 frac = frame_ix/(num_frames-1)
-                pose_img = interp_poses(pose_md1, pose_md2, alpha=frac).transpose(2,0,1)
-                control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
-                cond["c_concat"] = un_cond["c_concat"] = [control]
+
+                if controls is not None:
+                    pose_img = interp_poses(pose_md1, pose_md2, alpha=frac).transpose(2,0,1)
+                    control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
+                    cond["c_concat"] = un_cond["c_concat"] = [control]
+
                 if optimize_cond:
                     cond["c_crossattn"] = [interpolate_spherical(cond1, cond2, frac)]
                 
@@ -407,12 +386,14 @@ class ContextManager:
 
                     latents[frame_ix] = self.ddim_sampler.p_sample_ddim(latents[frame_ix], cond, ts, index=index, unconditional_guidance_scale=guide_scale,
                     unconditional_conditioning=un_cond)[0]
-                pdb.set_trace()
 
         for frame_ix in range(1,num_frames-1):
             x_samples = ldm.decode_first_stage(latents[frame_ix]).permute(0, 2, 3, 1)
             x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
             Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
+        
+        kwargs = dict(cond_lr=cond_lr, cond_steps=optimize_cond, prompt=prompt, n_prompt=n_prompt, ddim_steps=ddim_steps, guide_scale=guide_scale, step_schedule=step_schedule, bias=bias, retroactive_interp=retroactive_interp)
+        yaml.dump(kwargs, open(f'{out_dir}/args.yaml', 'w'))
     
     def get_latent_stack(self, img1, img2, timesteps):
         ldm = self.model
