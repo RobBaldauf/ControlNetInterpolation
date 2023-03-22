@@ -7,11 +7,11 @@ import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
+F = torch.nn.functional
 
 import yaml
 from tqdm import trange
-from pytorch_lightning import seed_everything
-from annotator.util import resize_image, HWC3
+from annotator.util import HWC3
 from annotator.openpose import OpenposeDetector
 from annotator.canny import CannyDetector
 from annotator.uniformer import UniformerDetector
@@ -19,13 +19,14 @@ from cldm.model import create_model, load_state_dict
 from cldm.ddim_hacked import DDIMSampler
 from controlnet.annotator.openpose import util
 
-def get_step_schedule(max_steps, num_levels, schedule_type='convex'):
+def get_step_schedule(min_steps, max_steps, num_levels, schedule_type='convex'):
+    diff = max_steps - min_steps
     if schedule_type == 'concave':
-        return [int(max_steps * x**.5 / 10) for x in np.linspace(0, 100, num_levels+1)]
+        return [0]+[int(diff * x**.5)+min_steps for x in np.linspace(0, 1, num_levels)]
     elif schedule_type == 'convex':
-        return [int(max_steps * x**2 / 16) for x in np.linspace(0, 4, num_levels+1)]
+        return [0]+[int(diff * x**2)+min_steps for x in np.linspace(0, 1, num_levels)]
     elif schedule_type == 'linear':
-        return [int(x) for x in np.linspace(0, max_steps, num_levels+1)]
+        return [0]+[int(x) for x in np.linspace(min_steps, max_steps, num_levels)]
 
 def extract_into_tensor(a, t, x_shape):
     b, *_ = t.shape
@@ -36,7 +37,7 @@ def interpolate_linear(p0,p1, frac):
     return p0 + (p1 - p0) * frac
 
 @torch.no_grad()
-def interpolate_spherical(p0, p1, fract_mixing: float):
+def slerp(p0, p1, fract_mixing: float):
     r""" Copied from lunarring/latentblending
     Helper function to correctly mix two random variables using spherical interpolation.
     The function will always cast up to float64 for sake of extra 4.
@@ -77,7 +78,7 @@ def interpolate_spherical(p0, p1, fract_mixing: float):
         
     return interp
 
-def interp_poses(pose_md1, pose_md2, alpha = 0.5):
+def interp_poses(pose_md1, pose_md2, alpha, shape):
     candidate = []
     subset = [-1] * 20
     for i in range(18):
@@ -91,7 +92,7 @@ def interp_poses(pose_md1, pose_md2, alpha = 0.5):
             interpolate_linear(pose_md1['candidate'][j][1], pose_md2['candidate'][k][1], alpha),
             0,i])
         subset[i] = i
-    canvas = np.zeros((512, 512, 3), dtype=np.uint8)
+    canvas = np.zeros((*shape, 3), dtype=np.uint8)
     canvas = util.draw_bodypose(canvas, np.array(candidate), np.array([subset]))
     return canvas
 
@@ -134,20 +135,28 @@ class ContextManager:
                 self.model.load_state_dict(load_state_dict('./controlnet/models/control_sd15_canny.pth', location='cuda'))
         elif mode == 'seg':
             self.model.load_state_dict(load_state_dict('./controlnet/models/control_sd15_seg.pth', location='cuda'))
+        self.mode = mode
 
     def get_canny(self, image, lower_bound=220, upper_bound=255):
         self.change_mode('canny')
+        # with torch.autocast('cuda'):
         canny = self.filters['canny'](HWC3(np.array(image)), lower_bound, upper_bound)
         return canny
         
-    def get_pose(self, image, return_metadata=False):
+    def get_pose(self, image, return_metadata=False, filter_largest=True):
         self.change_mode('pose')
         pred_pose, metadata = self.filters['pose'](HWC3(np.array(image)))
+        if filter_largest and len(metadata['subset']) > 1:
+            ix = np.argmax([s[-2] for s in metadata['subset']])
+            metadata['subset'] = [metadata['subset'][ix]]
+            pred_pose = np.zeros((*image.size, 3), dtype=np.uint8)
+            pred_pose = util.draw_bodypose(pred_pose, np.array(metadata['candidate']), np.array(metadata['subset']))
+            
         if return_metadata:
             return pred_pose, metadata
         return pred_pose
         
-    def learn_conditioning(self, img1, img2, cond, cond_base, uncond_base, ddim_steps, guide_scale, num_iters=200, cond_lr=1e-4):
+    def learn_conditioning(self, img1, img2, cond_base, uncond_base, ddim_steps, guide_scale, num_iters=200, cond_lr=1e-4):
         # augment = transforms.TrivialAugmentWide(num_magnitude_bins=20)
         augment = transforms.Compose([
             transforms.ColorJitter(brightness=0.1, contrast=0.2, saturation=0.2, hue=0.1),
@@ -212,89 +221,103 @@ class ContextManager:
         os.makedirs(out_dir)
         for frame_ix in trange(1,num_frames-1):
             frac = frame_ix/(num_frames-1)
-            latent = interpolate_spherical(L1, L2, frac)
+            latent = slerp(L1, L2, frac)
             x_samples = ldm.decode_first_stage(latent).permute(0, 2, 3, 1)
             x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
             Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
 
-    def interpolate_then_diffuse(self, img1, pose_md1, img2, pose_md2, num_frames, cond_path=None, cond_lr=1e-4, prompt=None, n_prompt=None, ddim_steps=250, guide_scale=7.5, schedule_type='concave', optimize_cond=0, out_dir='blend'): #steps_per_frame=10, 
+    def interpolate_then_diffuse(self, img1, img2, num_frames, controls=None, control_type='pose', min_steps=.25, max_steps=.5, prompt=None, n_prompt=None, ddim_steps=250, guide_scale=7.5, schedule_type='linear', optimize_cond=0, cond_path=None, cond_lr=1e-4, out_dir='blend'): #steps_per_frame=10, 
         """
         each successive frame has more noise than the previous
         """
+        if min_steps < 1:
+            min_steps = int(ddim_steps * min_steps)
+        if max_steps < 1:
+            max_steps = int(ddim_steps * max_steps)
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir)
+
         if isinstance(img1, Image.Image):
             img1.save(f'{out_dir}/{0:03d}.png')
             img2.save(f'{out_dir}/{num_frames-1:03d}.png')
             img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
             img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
         
-        self.change_mode('pose')
+        if controls is None:
+            self.init_mode()
+        else:
+            self.change_mode(control_type)
+            if control_type == 'pose':
+                pose_md1, pose_md2 = controls
+            else:
+                raise NotImplementedError
         ldm = self.model
         ldm.control_scales = [1] * 13
-        H = W = 512
-        shape = (4, H // 8, W // 8)
 
         if cond_path and os.path.exists(cond_path):
-            optimize_cond = True
+            assert optimize_cond > 0
             cond1, cond2, uncond_base = torch.load(cond_path)
-            cond = {}
-            un_cond = {"c_crossattn": [uncond_base]}
         else:
-            cond_base = ldm.get_learned_conditioning([prompt])
+            cond1 = ldm.get_learned_conditioning([prompt])
             uncond_base = ldm.get_learned_conditioning([n_prompt])
-            cond = {"c_crossattn": [cond_base], 'c_concat': None}
-            un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
 
             if optimize_cond:
-                cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond, cond_base, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
+                cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond1, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
                 if cond_path:
                     torch.save((cond1, cond2, uncond_base), cond_path)
+
+        cond = {"c_crossattn": [cond1], 'c_concat': None}
+        un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
 
         img1 = img1.float() / 127.5 - 1.0
         img2 = img2.float() / 127.5 - 1.0
         # schedules include endpoints
         self.ddim_sampler.make_schedule(ddim_steps, verbose=False)
-        step_schedule = get_step_schedule(.7*ddim_steps, (num_frames+1)//2, schedule_type=schedule_type)
+        step_schedule = get_step_schedule(min_steps, max_steps, (num_frames+1)//2, schedule_type=schedule_type)
         timestep_schedule = [self.ddim_sampler.ddim_timesteps[s] for s in step_schedule]
         latents1, latents2 = self.get_latent_stack(img1, img2, timestep_schedule)
         latents = [None] * num_frames
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
+        shape = latents[0].shape[-3:]
         
-        with torch.no_grad():
-            for frame_ix in trange(1,num_frames-1):
-                frac = frame_ix/(num_frames-1)
-                f = min(frame_ix, num_frames - frame_ix - 1)
-                # ldm.control_scales = [0.5 + 3*f/num_frames] * 13 # range from 0.5 to 2
-                latents[frame_ix] = interpolate_spherical(latents1[f], latents2[f], frac)
-                pose_img = interp_poses(pose_md1, pose_md2, alpha=frac).transpose(2,0,1)
-                control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
-
-                cond["c_concat"] = [control]
-                un_cond["c_concat"] = [control]
-                if optimize_cond:
-                    cond["c_crossattn"] = [interpolate_spherical(cond1, cond2, frac)]
-                samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
-                    shape, cond, verbose=False,
-                    x_T=latents[frame_ix], timesteps=step_schedule[f],
-                    unconditional_guidance_scale=guide_scale,
-                    unconditional_conditioning=un_cond)
-
-                x_samples = ldm.decode_first_stage(samples).permute(0, 2, 3, 1)
-                x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
-                Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
-
         kwargs = dict(cond_lr=cond_lr, cond_steps=optimize_cond, prompt=prompt, n_prompt=n_prompt, ddim_steps=ddim_steps, guide_scale=guide_scale, step_schedule=step_schedule)
         yaml.dump(kwargs, open(f'{out_dir}/args.yaml', 'w'))
 
-    def interpolate(self, img1, img2, controls=None, control_type='pose', cond_path=None, cond_lr=1e-4, prompt=None, n_prompt=None, max_steps=200, ddim_steps=250, num_frames=17, guide_scale=7.5, schedule_type='concave', optimize_cond=0, bias=0, retroactive_interp=True, out_dir='blend'):
+        for frame_ix in trange(1,num_frames-1):
+            frac = frame_ix/(num_frames-1)
+            f = min(frame_ix, num_frames - frame_ix - 1)
+            latents[frame_ix] = slerp(latents1[f], latents2[f], frac)
+            if controls is not None:
+                pose_img = interp_poses(pose_md1, pose_md2, alpha=frac, shape=img1.shape[-2:]).transpose(2,0,1)
+                control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
+                cond["c_concat"] = un_cond["c_concat"] = [control]
+
+            if optimize_cond:
+                cond["c_crossattn"] = [interpolate_linear(cond1, cond2, frac)]
+
+            samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
+                shape, cond, verbose=False,
+                x_T=latents[frame_ix], timesteps=step_schedule[f],
+                unconditional_guidance_scale=guide_scale,
+                unconditional_conditioning=un_cond)
+
+            x_samples = ldm.decode_first_stage(samples).permute(0, 2, 3, 1)
+            x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+            Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
+
+    def interpolate(self, img1, img2, controls=None, control_type='pose', prompt=None, n_prompt=None, min_steps=.25, max_steps=.5, ddim_steps=250, num_frames=17, guide_scale=7.5, schedule_type='linear', optimize_cond=0, latent_interp='spherical', cond_interp='spherical', cond_path=None, cond_lr=1e-4, bias=0, retroactive_interp=True, share_noise=True, out_dir='blend'):
         """
         ddim_steps: number of steps in DDIM sampling
         num_frames: includes endpoints (both original images)
         """
+        if min_steps < 1:
+            min_steps = int(ddim_steps * min_steps)
+        if max_steps < 1:
+            max_steps = int(ddim_steps * max_steps)
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir)
+    
         if isinstance(img1, Image.Image):
             img1.save(f'{out_dir}/{0:03d}.png')
             img2.save(f'{out_dir}/{num_frames-1:03d}.png')
@@ -305,26 +328,27 @@ class ContextManager:
             self.init_mode()
         else:
             self.change_mode(control_type)
-
+            if control_type == 'pose':
+                pose_md1, pose_md2 = controls
+            else:
+                raise NotImplementedError
         ldm = self.model
         ldm.control_scales = [1] * 13
-        H = W = 512
 
         if cond_path and os.path.exists(cond_path):
-            optimize_cond = True
+            assert optimize_cond > 0
             cond1, cond2, uncond_base = torch.load(cond_path)
-            cond = {'c_concat': None}
-            un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
         else:
-            cond_base = ldm.get_learned_conditioning([prompt])
+            cond1 = ldm.get_learned_conditioning([prompt])
             uncond_base = ldm.get_learned_conditioning([n_prompt])
-            cond = {"c_crossattn": [cond_base], 'c_concat': None}
-            un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
 
             if optimize_cond:
-                cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond, cond_base, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
+                cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond1, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
                 if cond_path:
                     torch.save((cond1, cond2, uncond_base), cond_path)
+
+        cond = {"c_crossattn": [cond1], 'c_concat': None}
+        un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
 
         img1 = img1.float() / 127.5 - 1.0
         img2 = img2.float() / 127.5 - 1.0
@@ -332,19 +356,22 @@ class ContextManager:
         num_levels = int(np.log2(num_frames-1)) # does not include endpoints
         assert np.log2(num_frames-1) % 1 < 1e-5
         self.ddim_sampler.make_schedule(ddim_steps, verbose=False)
-        step_schedule = get_step_schedule(max_steps, num_levels, schedule_type=schedule_type)
+        step_schedule = get_step_schedule(min_steps, max_steps, num_levels, schedule_type=schedule_type)
         timesteps = self.ddim_sampler.ddim_timesteps
         timestep_schedule = [timesteps[s] for s in step_schedule]
-        latents1, latents2 = self.get_latent_stack(img1, img2, timestep_schedule)
+        latents1, latents2 = self.get_latent_stack(img1, img2, timestep_schedule, share_noise=share_noise)
         latents = [None] * num_frames
         latents[0] = latents1[0]
         latents[-1] = latents2[0]
         
-        if controls is not None:
-            if control_type == 'pose':
-                pose_md1, pose_md2 = controls
-            else:
-                raise NotImplementedError
+        kwargs = dict(cond_lr=cond_lr, cond_steps=optimize_cond, prompt=prompt, n_prompt=n_prompt, ddim_steps=ddim_steps, guide_scale=guide_scale, step_schedule=step_schedule, bias=bias, retroactive_interp=retroactive_interp, share_noise=share_noise)
+        yaml.dump(kwargs, open(f'{out_dir}/args.yaml', 'w'))
+        
+        if latent_interp == 'linear':
+            interpolate_latents = interpolate_linear
+        else:
+            interpolate_latents = slerp
+
         for level in trange(1,num_levels+1):
             cur_ix = step_schedule[-level]
             prev_ix = step_schedule[-level-1]
@@ -358,27 +385,30 @@ class ContextManager:
                     frac -= bias
                 if frame_ix+df == num_frames-1:
                     frac += bias
-                latents[frame_ix] = interpolate_spherical(latents[frame_ix-df], latents[frame_ix+df], frac)
+                latents[frame_ix] = interpolate_latents(latents[frame_ix-df], latents[frame_ix+df], frac)
 
             if retroactive_interp:
                 if level == 2:
-                    latents[num_frames//2] = interpolate_spherical(latents[num_frames//4], latents[3*num_frames//4], .5)
+                    latents[num_frames//2] = interpolate_latents(latents[num_frames//4], latents[3*num_frames//4], .5)
                 
                 if level == 3:
-                    latents[num_frames//4] = interpolate_spherical(latents[num_frames//8], latents[3*num_frames//8], .5)
-                    latents[num_frames//2] = interpolate_spherical(latents[3*num_frames//8], latents[5*num_frames//8], .5)
-                    latents[3*num_frames//4] = interpolate_spherical(latents[5*num_frames//8], latents[7*num_frames//8], .5)
+                    latents[num_frames//4] = interpolate_latents(latents[num_frames//8], latents[3*num_frames//8], .5)
+                    latents[num_frames//2] = interpolate_latents(latents[3*num_frames//8], latents[5*num_frames//8], .5)
+                    latents[3*num_frames//4] = interpolate_latents(latents[5*num_frames//8], latents[7*num_frames//8], .5)
             
             for frame_ix in range(df, num_frames-1, df): # exclude endpoints
                 frac = frame_ix/(num_frames-1)
 
                 if controls is not None:
-                    pose_img = interp_poses(pose_md1, pose_md2, alpha=frac).transpose(2,0,1)
+                    pose_img = interp_poses(pose_md1, pose_md2, alpha=frac, shape=img1.shape[-2:]).transpose(2,0,1)
                     control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
                     cond["c_concat"] = un_cond["c_concat"] = [control]
 
                 if optimize_cond:
-                    cond["c_crossattn"] = [interpolate_spherical(cond1, cond2, frac)]
+                    if cond_interp == 'linear':
+                        cond["c_crossattn"] = [interpolate_linear(cond1, cond2, frac)]
+                    else:
+                        cond["c_crossattn"] = [slerp(cond1, cond2, frac)]
                 
                 for i, t in enumerate(np.flip(timesteps[prev_ix:cur_ix])):
                     index = cur_ix - i - 1
@@ -392,10 +422,276 @@ class ContextManager:
             x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
             Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
         
-        kwargs = dict(cond_lr=cond_lr, cond_steps=optimize_cond, prompt=prompt, n_prompt=n_prompt, ddim_steps=ddim_steps, guide_scale=guide_scale, step_schedule=step_schedule, bias=bias, retroactive_interp=retroactive_interp)
-        yaml.dump(kwargs, open(f'{out_dir}/args.yaml', 'w'))
+    def interpolate_qc(self, img1, img2, n_choices=8, qc_prompts=None, controls=None, control_type='pose', scale_control=False, prompt=None, n_prompt=None, min_steps=.3, max_steps=.55, ddim_steps=250, num_frames=17, guide_scale=7.5, schedule_type='linear', optimize_cond=0, latent_interp='spherical', cond_interp='spherical', cond_path=None, cond_lr=1e-4, bias=0, ddim_eta=0, out_dir='blend'):
+        if min_steps < 1:
+            min_steps = int(ddim_steps * min_steps)
+        if max_steps < 1:
+            max_steps = int(ddim_steps * max_steps)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        os.makedirs(out_dir)
     
-    def get_latent_stack(self, img1, img2, timesteps):
+        if isinstance(img1, Image.Image):
+            img1.save(f'{out_dir}/{0:03d}.png')
+            img2.save(f'{out_dir}/{num_frames-1:03d}.png')
+            img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
+            img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
+
+        if controls is None:
+            self.init_mode()
+        else:
+            self.change_mode(control_type)
+            if control_type == 'pose':
+                pose_md1, pose_md2 = controls
+            else:
+                raise NotImplementedError
+        ldm = self.model
+        if not scale_control:
+            ldm.control_scales = [1] * 13
+
+        if cond_path and os.path.exists(cond_path):
+            assert optimize_cond > 0
+            cond1, cond2, uncond_base = torch.load(cond_path)
+        else:
+            cond1 = ldm.get_learned_conditioning([prompt])
+            uncond_base = ldm.get_learned_conditioning([n_prompt])
+
+            if optimize_cond:
+                cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond1, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
+                if cond_path:
+                    torch.save((cond1, cond2, uncond_base), cond_path)
+
+        cond = {"c_crossattn": [cond1], 'c_concat': None}
+        un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
+
+        if qc_prompts is not None:
+            qc_prompt, qc_neg_prompt = qc_prompts
+            import clip
+            clip_model, preprocess = clip.load('ViT-L/14', device='cuda')
+            with torch.no_grad():
+                pos_embedding = clip_model.encode_text(clip.tokenize([qc_prompt]).to('cuda'))
+                neg_embedding = clip_model.encode_text(clip.tokenize([qc_neg_prompt]).to('cuda'))
+
+
+        # schedules include endpoints
+        num_levels = int(np.log2(num_frames-1)) # does not include endpoints
+        assert np.log2(num_frames-1) % 1 < 1e-5
+        self.ddim_sampler.make_schedule(ddim_steps, ddim_eta=ddim_eta, verbose=False)
+        step_schedule = get_step_schedule(min_steps, max_steps, num_levels, schedule_type=schedule_type)
+        timesteps = self.ddim_sampler.ddim_timesteps
+        final_latents = [None] * num_frames
+        final_latents[0] = ldm.get_first_stage_encoding(ldm.encode_first_stage(img1.float() / 127.5 - 1.0))
+        final_latents[-1] = ldm.get_first_stage_encoding(ldm.encode_first_stage(img2.float() / 127.5 - 1.0))
+        shape = final_latents[0].shape[-3:]
+        
+        kwargs = dict(cond_lr=cond_lr, cond_steps=optimize_cond, prompt=prompt, n_prompt=n_prompt, ddim_steps=ddim_steps, guide_scale=guide_scale, step_schedule=step_schedule, bias=bias, ddim_eta=ddim_eta, scale_control=scale_control)
+        yaml.dump(kwargs, open(f'{out_dir}/args.yaml', 'w'))
+        
+        if latent_interp == 'linear':
+            interpolate_latents = interpolate_linear
+        else:
+            interpolate_latents = slerp
+
+        for level in range(1,num_levels+1):
+            cur_step = step_schedule[-level]
+            t = timesteps[cur_step]
+            df = 2**(num_levels-level)
+                
+            for frame_ix in range(df, num_frames-1, df*2):
+                frac = frame_ix/(num_frames-1)
+                if scale_control:
+                    ldm.control_scales = [1.5-abs(frac-.5)] * 13 # range from 1.5 to 1
+
+                if controls is not None:
+                    pose_img = interp_poses(pose_md1, pose_md2, alpha=frac, shape=img1.shape[-2:]).transpose(2,0,1)
+                    control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
+                    cond["c_concat"] = un_cond["c_concat"] = [control]
+                if optimize_cond:
+                    if cond_interp == 'linear':
+                        cond["c_crossattn"] = [interpolate_linear(cond1, cond2, frac)]
+                    else:
+                        cond["c_crossattn"] = [slerp(cond1, cond2, frac)]
+
+                latent_frac = .5
+                if frame_ix-df == 0:
+                    latent_frac -= bias
+                if frame_ix+df == num_frames-1:
+                    latent_frac += bias
+
+                candidates = []
+                clip_scores = []
+                for choice_ix in range(n_choices):
+                    noise = torch.randn_like(final_latents[0])
+                    l1 = ldm.sqrt_alphas_cumprod[t] * final_latents[frame_ix-df] + ldm.sqrt_one_minus_alphas_cumprod[t] * noise
+                    l2 = ldm.sqrt_alphas_cumprod[t] * final_latents[frame_ix+df] + ldm.sqrt_one_minus_alphas_cumprod[t] * noise
+                    noisy_latent = interpolate_latents(l1, l2, latent_frac)
+
+                    samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
+                        shape, cond, verbose=False, eta=ddim_eta,
+                        x_T=noisy_latent, timesteps=cur_step,
+                        unconditional_guidance_scale=guide_scale,
+                        unconditional_conditioning=un_cond)
+                    candidates.append(samples)
+
+                    image = ldm.decode_first_stage(samples)
+                    if qc_prompts is None: #manual
+                        image = (image.permute(0, 2, 3, 1) * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+                        Image.fromarray(image[0]).save(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png')
+                    else:
+                        with torch.no_grad():
+                            image = preprocess.transforms[0](image)
+                            if shape[-1] != shape[-2]:
+                                image = preprocess.transforms[1](image)
+                            image_features = clip_model.encode_image(image)
+                        # clip_scores.append((image_features @ clip_text_embedding.T).item())
+                        clip_scores.append(F.cosine_similarity(image_features, pos_embedding).item() - F.cosine_similarity(image_features, neg_embedding).item())
+
+                if qc_prompts is None: #manual
+                    print(f'Enter choice (0-{n_choices}):')
+                    choice = input()
+                    for choice_ix in range(n_choices):
+                        if choice_ix != int(choice):
+                            os.remove(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png')
+                        else:
+                            os.rename(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png', f'{out_dir}/{frame_ix:03d}.png')
+                else:
+                    choice = np.argmax(clip_scores)
+                    image = ldm.decode_first_stage(candidates[int(choice)])
+                    image = (image.permute(0, 2, 3, 1) * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+                    Image.fromarray(image[0]).save(f'{out_dir}/{frame_ix:03d}.png')
+
+                
+                final_latents[frame_ix] = candidates[int(choice)]
+
+            n_choices = max(n_choices-1, 3) # reduce choices at fine-grained levels
+    
+    """def revise_frames(self, frame_range, out_dir, num_steps=.4, n_choices=6, qc_prompts=None, controls=None, control_type='pose', scale_control=False, prompt=None, n_prompt=None, ddim_steps=250, num_frames=17, guide_scale=7.5, optimize_cond=0, latent_interp='spherical', cond_interp='spherical', cond_path=None, cond_lr=1e-4, bias=0, ddim_eta=0):
+        if num_steps < 1:
+            num_steps = int(ddim_steps * num_steps)
+
+        img1 = Image.open(f'{out_dir}/{frame_range[0]-1:03d}.png')
+        img2 = Image.open(f'{out_dir}/{frame_range[1]:03d}.png')
+        if isinstance(img1, Image.Image):
+            img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
+            img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
+
+        if controls is None:
+            self.init_mode()
+        else:
+            self.change_mode(control_type)
+            if control_type == 'pose':
+                pose_md1, pose_md2 = controls
+            else:
+                raise NotImplementedError
+        ldm = self.model
+        if not scale_control:
+            ldm.control_scales = [1] * 13
+
+        if cond_path and os.path.exists(cond_path):
+            assert optimize_cond > 0
+            cond1, cond2, uncond_base = torch.load(cond_path)
+        else:
+            cond1 = ldm.get_learned_conditioning([prompt])
+            uncond_base = ldm.get_learned_conditioning([n_prompt])
+
+            if optimize_cond:
+                cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond1, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
+                if cond_path:
+                    torch.save((cond1, cond2, uncond_base), cond_path)
+
+        cond = {"c_crossattn": [cond1], 'c_concat': None}
+        un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
+
+        if qc_prompts is not None:
+            qc_prompt, qc_neg_prompt = qc_prompts
+            import clip
+            clip_model, preprocess = clip.load('ViT-L/14', device='cuda')
+            with torch.no_grad():
+                pos_embedding = clip_model.encode_text(clip.tokenize([qc_prompt]).to('cuda'))
+                neg_embedding = clip_model.encode_text(clip.tokenize([qc_neg_prompt]).to('cuda'))
+
+        # schedules include endpoints
+        self.ddim_sampler.make_schedule(ddim_steps, ddim_eta=ddim_eta, verbose=False)
+        t = self.ddim_sampler.ddim_timesteps[num_steps]
+        L1 = ldm.get_first_stage_encoding(ldm.encode_first_stage(img1.float() / 127.5 - 1.0))
+        L2 = ldm.get_first_stage_encoding(ldm.encode_first_stage(img2.float() / 127.5 - 1.0))
+        shape = L1.shape[-3:]
+        
+        if latent_interp == 'linear':
+            interpolate_latents = interpolate_linear
+        else:
+            interpolate_latents = slerp
+
+        for frame_ix in range(frame_range[0], frame_range[1]):
+            frac = frame_ix/(num_frames-1)
+            latent_frac = (frame_ix - frame_range[0]) / (frame_range[1] - frame_range[0])
+            if scale_control:
+                ldm.control_scales = [1.5-abs(frac-.5)] * 13 # range from 1.5 to 1
+
+            if controls is not None:
+                pose_img = interp_poses(pose_md1, pose_md2, alpha=frac, shape=img1.shape[-2:]).transpose(2,0,1)
+                control = torch.from_numpy(pose_img).float().cuda().unsqueeze(0) / 255.0
+                cond["c_concat"] = un_cond["c_concat"] = [control]
+            if optimize_cond:
+                if cond_interp == 'linear':
+                    cond["c_crossattn"] = [interpolate_linear(cond1, cond2, frac)]
+                else:
+                    cond["c_crossattn"] = [slerp(cond1, cond2, frac)]
+
+            candidates = []
+            clip_scores = []
+            for choice_ix in range(n_choices):
+                noise = torch.randn_like(L1)
+                l1 = ldm.sqrt_alphas_cumprod[t] * L1 + ldm.sqrt_one_minus_alphas_cumprod[t] * noise
+                l2 = ldm.sqrt_alphas_cumprod[t] * L2 + ldm.sqrt_one_minus_alphas_cumprod[t] * noise
+                noisy_latent = interpolate_latents(l1, l2, latent_frac)
+
+                samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
+                    shape, cond, verbose=False, eta=ddim_eta,
+                    x_T=noisy_latent, timesteps=cur_step,
+                    unconditional_guidance_scale=guide_scale,
+                    unconditional_conditioning=un_cond)
+                candidates.append(samples)
+
+                image = ldm.decode_first_stage(samples)
+                if qc_prompts is None: #manual
+                    image = (image.permute(0, 2, 3, 1) * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+                    Image.fromarray(image[0]).save(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png')
+                else:
+                    with torch.no_grad():
+                        image = preprocess.transforms[0](image)
+                        if shape[-1] != shape[-2]:
+                            image = preprocess.transforms[1](image)
+                        image_features = clip_model.encode_image(image)
+                    # clip_scores.append((image_features @ clip_text_embedding.T).item())
+                    clip_scores.append(F.cosine_similarity(image_features, pos_embedding).item() - F.cosine_similarity(image_features, neg_embedding).item())
+
+            if qc_prompts is None: #manual
+                print(f'Enter choice (0-{n_choices}):')
+                choice = input()
+                for choice_ix in range(n_choices):
+                    if choice_ix != int(choice):
+                        os.remove(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png')
+                    else:
+                        os.rename(f'{out_dir}/{frame_ix:03d}_{choice_ix}.png', f'{out_dir}/{frame_ix:03d}.png')
+            else:
+                choice = np.argmax(clip_scores)
+                image = ldm.decode_first_stage(candidates[int(choice)])
+                image = (image.permute(0, 2, 3, 1) * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
+                Image.fromarray(image[0]).save(f'{out_dir}/{frame_ix:03d}.png')
+
+            
+            final_latents[frame_ix] = candidates[int(choice)]
+    """
+    def visualize_poses(self, poses, num_frames, out_dir):
+        shutil.rmtree(out_dir, ignore_errors=True)
+        os.makedirs(out_dir)
+        for frame_ix in range(num_frames):
+            frac = frame_ix/(num_frames-1)
+            pose_img = interp_poses(*poses, alpha=frac, shape=(768,768))
+            Image.fromarray(pose_img).save(f'{out_dir}/{frame_ix:03d}.png')
+        exit()
+        
+    def get_latent_stack(self, img1, img2, timesteps, share_noise=True):
         ldm = self.model
         latents1 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img1))]
         latents2 = [ldm.get_first_stage_encoding(ldm.encode_first_stage(img2))]
@@ -404,6 +700,8 @@ class ContextManager:
         for t_now in timesteps[1:]:
             noise = torch.randn_like(latents1[-1])
             latents1.append(self.add_more_noise(latents1[-1], noise, t_now, t_prev))
+            if not share_noise:
+                noise = torch.randn_like(latents2[-1])
             latents2.append(self.add_more_noise(latents2[-1], noise, t_now, t_prev))
             t_prev = t_now
         return latents1, latents2
@@ -452,11 +750,10 @@ class ContextManager:
         cond = {"c_concat": [control], "c_crossattn": [ldm.get_learned_conditioning([prompt])]}
         un_cond = {"c_concat": [control], "c_crossattn": [ldm.get_learned_conditioning([n_prompt])]}
 
-        H = W = 512
-        shape = (4, H // 8, W // 8)
+        shape = noisy_latents[0].shape[-3:]
 
         ldm.control_scales = [ctrl_scale] * 13
-        samples, _ = self.ddim_sampler.sample_grad(ddim_steps, 1,
+        samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
             shape, cond, verbose=False, eta=eta, x_T=noisy_latents, timesteps=int(time_frac * ddim_steps),
             unconditional_guidance_scale=guide_scale,
             unconditional_conditioning=un_cond)
@@ -475,9 +772,7 @@ class ContextManager:
         cond = {"c_concat": [control], "c_crossattn": [self.model.get_learned_conditioning([prompt] * num_samples)]}
         un_cond = {"c_concat": [control], "c_crossattn": [self.model.get_learned_conditioning([n_prompt] * num_samples)]}
 
-        H = W = 512
-        shape = (4, H // 8, W // 8)
-
+        shape = (4, control.size(-2)//4, control.size(-1)//4)
         self.model.control_scales = [ctrl_scale] * 13
         samples, _ = self.ddim_sampler.sample(ddim_steps, num_samples,
                                 shape, cond, verbose=False, eta=eta,
