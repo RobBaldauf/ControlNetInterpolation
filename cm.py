@@ -80,20 +80,28 @@ def slerp(p0, p1, fract_mixing: float):
 
 def interp_poses(pose_md1, pose_md2, alpha, shape):
     candidate = []
-    subset = [-1] * 20
-    for i in range(18):
-        j = int(pose_md1['subset'][0][i])
-        k = int(pose_md2['subset'][0][i])
-        if j == -1 or k == -1:
-            candidate.append([-1,-1,0,i])
-            subset[i] = -1
-            continue
-        candidate.append([interpolate_linear(pose_md1['candidate'][j][0], pose_md2['candidate'][k][0], alpha),
-            interpolate_linear(pose_md1['candidate'][j][1], pose_md2['candidate'][k][1], alpha),
-            0,i])
-        subset[i] = i
+    subsets = []
+    cand_ix = 0
+    for person in range(len(pose_md1['subset'])):
+        subset = [-1] * 20
+        for i in range(18):
+            j = int(pose_md1['subset'][person][i])
+            k = int(pose_md2['subset'][person][i])
+            if j == -1 or k == -1:
+                subset[i] = -1
+                continue
+            candidate.append([interpolate_linear(pose_md1['candidate'][j][0], pose_md2['candidate'][k][0], alpha),
+                interpolate_linear(pose_md1['candidate'][j][1], pose_md2['candidate'][k][1], alpha),
+                0,cand_ix])
+            subset[i] = cand_ix
+            cand_ix += 1
+        subsets.append(subset)
+    # candidate.append([-1,-1,0,i])
     canvas = np.zeros((*shape, 3), dtype=np.uint8)
-    canvas = util.draw_bodypose(canvas, np.array(candidate), np.array([subset]))
+    canvas = util.draw_bodypose(canvas, np.array(candidate), np.array(subsets))
+    # candidate = pose_md1['candidate']
+    # subsets = pose_md1['subset']
+    # Image.fromarray(canvas).save('rick_poses/test.png')
     return canvas
 
 class ContextManager:
@@ -146,12 +154,35 @@ class ContextManager:
     def get_pose(self, image, return_metadata=False, filter_largest=True):
         self.change_mode('pose')
         pred_pose, metadata = self.filters['pose'](HWC3(np.array(image)))
-        if filter_largest and len(metadata['subset']) > 1:
-            ix = np.argmax([s[-2] for s in metadata['subset']])
-            metadata['subset'] = [metadata['subset'][ix]]
-            pred_pose = np.zeros((*image.size, 3), dtype=np.uint8)
-            pred_pose = util.draw_bodypose(pred_pose, np.array(metadata['candidate']), np.array(metadata['subset']))
-            
+        if len(metadata['subset']) > 1:
+            if filter_largest:
+                sizes = []
+                for ss in metadata['subset']:
+                    min_x = min_y = 1000
+                    max_x = max_y = 0
+                    for i in range(18):
+                        if ss[i] != -1:
+                            x, y = metadata['candidate'][int(ss[i])][:2]
+                            min_x = min(min_x, x)
+                            min_y = min(min_y, y)
+                            max_x = max(max_x, x)
+                            max_y = max(max_y, y)
+                    sizes.append((max_x-min_x) * (max_y-min_y))
+                ix = np.argmax(sizes)
+                metadata['subset'] = [metadata['subset'][ix]]
+                pred_pose = np.zeros((*image.size[::-1], 3), dtype=np.uint8)
+                pred_pose = util.draw_bodypose(pred_pose, np.array(metadata['candidate']), np.array(metadata['subset']))
+            else: # order left to right
+                minX = []
+                for ss in metadata['subset']:
+                    min_x = 1000
+                    for i in range(18):
+                        if ss[i] != -1:
+                            min_x = min(min_x, metadata['candidate'][int(ss[i])][0])
+                    minX.append(min_x)
+                indices = np.argsort(minX)
+                metadata['subset'] = [metadata['subset'][ix] for ix in indices]
+
         if return_metadata:
             return pred_pose, metadata
         return pred_pose
@@ -422,7 +453,7 @@ class ContextManager:
             x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
             Image.fromarray(x_samples[0]).save(f'{out_dir}/{frame_ix:03d}.png')
         
-    def interpolate_qc(self, img1, img2, n_choices=8, qc_prompts=None, controls=None, control_type='pose', scale_control=False, prompt=None, n_prompt=None, min_steps=.3, max_steps=.55, ddim_steps=250, num_frames=17, guide_scale=7.5, schedule_type='linear', optimize_cond=0, latent_interp='spherical', cond_interp='spherical', cond_path=None, cond_lr=1e-4, bias=0, ddim_eta=0, out_dir='blend'):
+    def interpolate_qc(self, img1, img2, n_choices=8, qc_prompts=None, controls=None, control_type='pose', scale_control=1.5, prompt=None, n_prompt=None, min_steps=.3, max_steps=.55, ddim_steps=250, num_frames=17, guide_scale=7.5, schedule_type='linear', optimize_cond=0, latent_interp='spherical', cond_interp='spherical', cond_path=None, cond_lr=1e-4, bias=0, ddim_eta=0, out_dir='blend'):
         if min_steps < 1:
             min_steps = int(ddim_steps * min_steps)
         if max_steps < 1:
@@ -499,7 +530,7 @@ class ContextManager:
             for frame_ix in range(df, num_frames-1, df*2):
                 frac = frame_ix/(num_frames-1)
                 if scale_control:
-                    ldm.control_scales = [1.5-abs(frac-.5)] * 13 # range from 1.5 to 1
+                    ldm.control_scales = [scale_control - 2*abs(frac-.5) * (scale_control-1)] * 13 # range from 1 to scale_control
 
                 if controls is not None:
                     pose_img = interp_poses(pose_md1, pose_md2, alpha=frac, shape=img1.shape[-2:]).transpose(2,0,1)
@@ -683,13 +714,11 @@ class ContextManager:
             final_latents[frame_ix] = candidates[int(choice)]
     """
     def visualize_poses(self, poses, num_frames, out_dir):
-        shutil.rmtree(out_dir, ignore_errors=True)
-        os.makedirs(out_dir)
+        os.makedirs(out_dir, exist_ok=True)
         for frame_ix in range(num_frames):
             frac = frame_ix/(num_frames-1)
             pose_img = interp_poses(*poses, alpha=frac, shape=(768,768))
             Image.fromarray(pose_img).save(f'{out_dir}/{frame_ix:03d}.png')
-        exit()
         
     def get_latent_stack(self, img1, img2, timesteps, share_noise=True):
         ldm = self.model
@@ -722,20 +751,25 @@ class ContextManager:
         return scale * latents + sigma * noise
     
     @torch.no_grad()
-    def img2img(self, control, prompt, n_prompt, init_img=None, noise=None, mode=None, time_frac=0.3,
-                ddim_steps=50, ctrl_scale=1, guide_scale=7.5, eta=0):
+    def img2img(self, prompt, n_prompt, init_img=None, control=None, noise=None, mode=None, time_frac=0.3, ddim_steps=50, ctrl_scale=1, guide_scale=7.5, eta=0):
         if mode is not None:
             self.change_mode(mode)
         elif self.mode is None:
             print('no mode set')
             return
         
-        if not isinstance(control, torch.Tensor):
-            control = torch.from_numpy(control).float().cuda().unsqueeze(0) / 255.0
-            if len(control.shape) == 3:
-                control = control.tile(1, 3, 1, 1)
-
         ldm = self.model
+        cond = {"c_concat": None, "c_crossattn": [ldm.get_learned_conditioning([prompt])]}
+        un_cond = {"c_concat": None, "c_crossattn": [ldm.get_learned_conditioning([n_prompt])]}
+
+        if control is not None:
+            if not isinstance(control, torch.Tensor):
+                control = torch.from_numpy(control).float().cuda().unsqueeze(0) / 255.0
+                if len(control.shape) == 3:
+                    control = control.tile(1, 3, 1, 1)
+
+            cond["c_concat"] = un_cond["c_concat"] = [control]
+
         if init_img is not None:
             if isinstance(init_img, Image.Image):
                 init_img = torch.tensor(np.array(init_img)).float().cuda() / 127.5 - 1.0
@@ -747,9 +781,6 @@ class ContextManager:
         noisy_latents = (extract_into_tensor(ldm.sqrt_alphas_cumprod, t, latents.shape) * latents +
             extract_into_tensor(ldm.sqrt_one_minus_alphas_cumprod, t, latents.shape) * noise)
             
-        cond = {"c_concat": [control], "c_crossattn": [ldm.get_learned_conditioning([prompt])]}
-        un_cond = {"c_concat": [control], "c_crossattn": [ldm.get_learned_conditioning([n_prompt])]}
-
         shape = noisy_latents[0].shape[-3:]
 
         ldm.control_scales = [ctrl_scale] * 13
@@ -763,22 +794,28 @@ class ContextManager:
         return x_samples[0]
 
     @torch.no_grad()
-    def generate(self, control, prompt, n_prompt, num_samples=1,
-                ddim_steps=50, ctrl_scale=1, guide_scale=7.5, eta=0):
-        control = torch.from_numpy(control).float().cuda() / 255.0
-        control = torch.stack([control for _ in range(num_samples)], dim=0)
-        control = control.permute(0, 3, 1, 2)
+    def generate(self, control, prompt, n_prompt, mode=None, ddim_steps=50, ctrl_scale=1, guide_scale=7.5, eta=0):
+        if mode is not None:
+            self.change_mode(mode)
+        elif self.mode is None:
+            print('no mode set')
+            return
+        
+        if not isinstance(control, torch.Tensor):
+            control = torch.from_numpy(control).float().cuda().unsqueeze(0) / 255.0
+            if len(control.shape) == 3:
+                control = control.tile(1, 3, 1, 1)
+        ldm = self.model
+        cond = {"c_concat": [control], "c_crossattn": [ldm.get_learned_conditioning([prompt])]}
+        un_cond = {"c_concat": [control], "c_crossattn": [ldm.get_learned_conditioning([n_prompt])]}
 
-        cond = {"c_concat": [control], "c_crossattn": [self.model.get_learned_conditioning([prompt] * num_samples)]}
-        un_cond = {"c_concat": [control], "c_crossattn": [self.model.get_learned_conditioning([n_prompt] * num_samples)]}
-
-        shape = (4, control.size(-2)//4, control.size(-1)//4)
+        shape = (4, control.size(-2)//8, control.size(-1)//8)
         self.model.control_scales = [ctrl_scale] * 13
-        samples, _ = self.ddim_sampler.sample(ddim_steps, num_samples,
+        samples, _ = self.ddim_sampler.sample(ddim_steps, 1,
                                 shape, cond, verbose=False, eta=eta,
                                 unconditional_guidance_scale=guide_scale,
                                 unconditional_conditioning=un_cond)
 
         x_samples = self.model.decode_first_stage(samples).permute(0, 2, 3, 1)
         x_samples = (x_samples * 127.5 + 127.5).cpu().numpy().clip(0, 255).astype(np.uint8)
-        return [x_samples[i] for i in range(num_samples)]
+        return x_samples[0]
