@@ -8,11 +8,11 @@ Images and prompts used in our paper are contained in `sample_imgs` and `sample_
 
 If you use this work in your research, please use the following citation:
 ```
-@misc{wang2023interpolateldm,
+@misc{wang2023interpolating,
       title={Interpolating between Images with Diffusion Models}, 
       author={Clinton J. Wang and Polina Golland},
       year={2023},
-      eprint={},
+      eprint={2307.12560},
       archivePrefix={arXiv},
       primaryClass={cs.LG}
 }
