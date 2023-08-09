@@ -1,6 +1,6 @@
 # Interpolating between Images with Diffusion Models
 
-[Project](https://clintonjwang.github.io/interpolation) | [Paper](https://arxiv.org/abs/2206.01178)
+[Project](https://clintonjwang.github.io/interpolation) | [Paper](https://arxiv.org/abs/2307.12560)
 
 ![Interpolate between diverse input images](https://github.com/clintonjwang/ControlNet/blob/main/github_teaser.png?raw=true)
 
