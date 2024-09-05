@@ -17,7 +17,7 @@ from annotator.canny import CannyDetector
 from annotator.uniformer import UniformerDetector
 from cldm.model import create_model, load_state_dict
 from cldm.ddim_hacked import DDIMSampler
-from controlnet.annotator.openpose import util
+from annotator.openpose import util
 
 def get_step_schedule(min_steps, max_steps, num_levels, schedule_type='convex'):
     diff = max_steps - min_steps
@@ -110,9 +110,9 @@ class ContextManager:
         self.mode = None
         self.version = version
         if version == '2.1':
-            self.model = create_model('./controlnet/models/cldm_v21.yaml').cuda()
+            self.model = create_model('./models/cldm_v21.yaml').cuda()
         else:
-            self.model = create_model('./controlnet/models/cldm_v15.yaml').cuda()
+            self.model = create_model('./models/cldm_v15.yaml').cuda()
         self.ddim_sampler = DDIMSampler(self.model)
 
     def init_mode(self):
@@ -133,16 +133,16 @@ class ContextManager:
         
         if mode == 'pose':
             if self.version == '2.1':
-                self.model.load_state_dict(load_state_dict('./controlnet/models/openpose-sd21.ckpt', location='cuda'))
+                self.model.load_state_dict(load_state_dict('./models/openpose-sd21.ckpt', location='cuda'))
             else:
-                self.model.load_state_dict(load_state_dict('./controlnet/models/control_sd15_openpose.pth', location='cuda'))
+                self.model.load_state_dict(load_state_dict('./models/control_sd15_openpose.pth', location='cuda'))
         elif mode == 'canny':
             if self.version == '2.1':
-                self.model.load_state_dict(load_state_dict('./controlnet/models/canny-sd21.ckpt', location='cuda'))
+                self.model.load_state_dict(load_state_dict('./models/canny-sd21.ckpt', location='cuda'))
             else:
-                self.model.load_state_dict(load_state_dict('./controlnet/models/control_sd15_canny.pth', location='cuda'))
+                self.model.load_state_dict(load_state_dict('./models/control_sd15_canny.pth', location='cuda'))
         elif mode == 'seg':
-            self.model.load_state_dict(load_state_dict('./controlnet/models/control_sd15_seg.pth', location='cuda'))
+            self.model.load_state_dict(load_state_dict('./models/control_sd15_seg.pth', location='cuda'))
         self.mode = mode
 
     def get_canny(self, image, lower_bound=220, upper_bound=255):
