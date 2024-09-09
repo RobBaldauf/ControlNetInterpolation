@@ -1,3 +1,4 @@
+import gc
 import pdb
 import shutil
 from share import *
@@ -109,10 +110,12 @@ class ContextManager:
         self.filters = {}
         self.mode = None
         self.version = version
+        print("0.1")
         if version == '2.1':
             self.model = create_model('./models/cldm_v21.yaml').cuda()
         else:
             self.model = create_model('./models/cldm_v15.yaml').cuda()
+        print("0.2")
         self.ddim_sampler = DDIMSampler(self.model)
 
     def init_mode(self):
@@ -133,7 +136,7 @@ class ContextManager:
         
         if mode == 'pose':
             if self.version == '2.1':
-                self.model.load_state_dict(load_state_dict('./models/openpose-sd21.ckpt', location='cuda'))
+                self.model.load_state_dict(load_state_dict('./models/control_v11p_sd21_openpose.ckpt', location='cuda'))
             else:
                 self.model.load_state_dict(load_state_dict('./models/control_sd15_openpose.pth', location='cuda'))
         elif mode == 'canny':
@@ -348,13 +351,13 @@ class ContextManager:
             max_steps = int(ddim_steps * max_steps)
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir)
-    
+        print("a")    
         if isinstance(img1, Image.Image):
             img1.save(f'{out_dir}/{0:03d}.png')
             img2.save(f'{out_dir}/{num_frames-1:03d}.png')
             img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
             img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
-
+        print("b")
         if controls is None:
             self.init_mode()
         else:
@@ -365,7 +368,7 @@ class ContextManager:
                 raise NotImplementedError
         ldm = self.model
         ldm.control_scales = [1] * 13
-
+        print("c")
         if cond_path and os.path.exists(cond_path):
             assert optimize_cond > 0
             cond1, cond2, uncond_base = torch.load(cond_path)
@@ -377,7 +380,7 @@ class ContextManager:
                 cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond1, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
                 if cond_path:
                     torch.save((cond1, cond2, uncond_base), cond_path)
-
+        print("d")
         cond = {"c_crossattn": [cond1], 'c_concat': None}
         un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
 
@@ -460,13 +463,13 @@ class ContextManager:
             max_steps = int(ddim_steps * max_steps)
         shutil.rmtree(out_dir, ignore_errors=True)
         os.makedirs(out_dir)
-    
+        print("a")
         if isinstance(img1, Image.Image):
             img1.save(f'{out_dir}/{0:03d}.png')
             img2.save(f'{out_dir}/{num_frames-1:03d}.png')
             img1 = torch.tensor(np.array(img1)).permute(2,0,1).unsqueeze(0).cuda()
             img2 = torch.tensor(np.array(img2)).permute(2,0,1).unsqueeze(0).cuda()
-
+        print("b")
         if controls is None:
             self.init_mode()
         else:
@@ -475,6 +478,7 @@ class ContextManager:
                 pose_md1, pose_md2 = controls
             else:
                 raise NotImplementedError
+        print("c")
         ldm = self.model
         if not scale_control:
             ldm.control_scales = [1] * 13
@@ -490,7 +494,7 @@ class ContextManager:
                 cond1, cond2, uncond_base = self.learn_conditioning(img1, img2, cond1, uncond_base, ddim_steps, guide_scale=guide_scale, num_iters=optimize_cond, cond_lr=cond_lr)
                 if cond_path:
                     torch.save((cond1, cond2, uncond_base), cond_path)
-
+        print("d")
         cond = {"c_crossattn": [cond1], 'c_concat': None}
         un_cond = {"c_crossattn": [uncond_base], 'c_concat': None}
 
@@ -501,7 +505,6 @@ class ContextManager:
             with torch.no_grad():
                 pos_embedding = clip_model.encode_text(clip.tokenize([qc_prompt]).to('cuda'))
                 neg_embedding = clip_model.encode_text(clip.tokenize([qc_neg_prompt]).to('cuda'))
-
 
         # schedules include endpoints
         num_levels = int(np.log2(num_frames-1)) # does not include endpoints
@@ -594,7 +597,10 @@ class ContextManager:
                 final_latents[frame_ix] = candidates[int(choice)]
 
             n_choices = max(n_choices-1, 3) # reduce choices at fine-grained levels
-    
+            # del clip_model, preprocess
+            # gc.collect()
+            # torch.cuda.empty_cache()
+
     """def revise_frames(self, frame_range, out_dir, num_steps=.4, n_choices=6, qc_prompts=None, controls=None, control_type='pose', scale_control=False, prompt=None, n_prompt=None, ddim_steps=250, num_frames=17, guide_scale=7.5, optimize_cond=0, latent_interp='spherical', cond_interp='spherical', cond_path=None, cond_lr=1e-4, bias=0, ddim_eta=0):
         if num_steps < 1:
             num_steps = int(ddim_steps * num_steps)
